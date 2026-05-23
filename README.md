@@ -50,3 +50,10 @@ CLAIM_ONLY_STATUS=queued
 ```bash
 curl https://TU-DOMINIO.up.railway.app/health
 ```
+
+
+## Fix incluido en esta versión
+
+- Descarga de archivos SECOP con headers tipo navegador para mitigar HTTP 403.
+- Guarda en `error_message` el status HTTP y una vista previa del body cuando la descarga falla.
+- Mantiene el flujo existente: claim en Edge Function, signed upload y complete/fail por API interna.

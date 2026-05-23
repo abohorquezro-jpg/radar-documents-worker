@@ -16,7 +16,7 @@ const {
   CLAIM_ONLY_STATUS = "queued"
 } = process.env;
 
-const WORKER_VERSION = "1.0.0-production-edge-api";
+const WORKER_VERSION = "1.0.1-production-secops-403-fix";
 
 function nowIso() {
   return new Date().toISOString();
@@ -69,6 +69,36 @@ async function parseJsonResponse(response) {
   } catch {
     return { raw_response: text };
   }
+}
+
+async function readBodyPreview(response, maxChars = 300) {
+  try {
+    const text = await response.text();
+    return text ? text.slice(0, maxChars) : "";
+  } catch {
+    return "";
+  }
+}
+
+function secopBrowserHeaders() {
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/pdf,application/octet-stream,image/*,*/*",
+    "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
+    "Referer": "https://community.secop.gov.co/",
+    "Origin": "https://community.secop.gov.co",
+    "Connection": "keep-alive"
+  };
+}
+
+async function downloadSecopFile(url, signal) {
+  return fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    headers: secopBrowserHeaders(),
+    signal
+  });
 }
 
 async function callDocumentsApi(payload) {
@@ -254,16 +284,12 @@ async function processOneDocument(doc, options) {
   const { controller, timeout } = withTimeout(toInt(DOWNLOAD_TIMEOUT_SECONDS, 180));
 
   try {
-    const downloadResponse = await fetch(doc.source_download_url, {
-      redirect: "follow",
-      headers: {
-        "User-Agent": "Mozilla/5.0 radar-documents-worker/1.0"
-      },
-      signal: controller.signal
-    });
+    const downloadResponse = await downloadSecopFile(doc.source_download_url, controller.signal);
 
     if (!downloadResponse.ok) {
-      throw new Error(`Download failed: HTTP ${downloadResponse.status}`);
+      const bodyPreview = await readBodyPreview(downloadResponse, 300);
+      const suffix = bodyPreview ? ` Body: ${bodyPreview}` : "";
+      throw new Error(`Download failed: HTTP ${downloadResponse.status}${suffix}`);
     }
 
     const contentType =

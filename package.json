@@ -1,6 +1,6 @@
 {
   "name": "radar-documents-worker-production",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "description": "Railway worker for heavy SECOP document processing through secure Supabase Edge Function API.",
