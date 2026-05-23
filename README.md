@@ -1,59 +1,34 @@
-# Radar Documents Worker — Fixed Deploy Structure
+# Radar Documents Worker Pipeline
 
-Esta versión evita el error:
+Railway worker para SECOP II documentos.
 
-```text
-Cannot find module '/app/src/index.js'
-```
+## Rutas
 
-porque el entrypoint principal ahora está en la raíz:
+- `GET /health`
+- `POST /secop-documents/process-pending`: procesa documentos ya en `queued`.
+- `POST /secop-documents/process-pipeline`: lista oportunidades viables, consulta documentos en datos.gov.co por lotes, guarda metadata y descarga/sube archivos.
 
-```text
-index.js
-```
-
-También se incluye una copia en:
-
-```text
-src/index.js
-```
-
-## Estructura correcta del repo
-
-```text
-package.json
-index.js
-railway.json
-README.md
-.env.example
-.gitignore
-src/index.js
-```
-
-## Railway variables
+## Variables requeridas en Railway
 
 ```env
-INTERNAL_API_SECRET=el_mismo_secret_de_n8n_y_la_edge_function
 DOCUMENTS_API_URL=https://infxodoiupqivhgzsgza.supabase.co/functions/v1/secop-documents-api
+INTERNAL_API_SECRET=...
 SUPABASE_STORAGE_BUCKET=secop-documents
-DEFAULT_LIMIT=20
-MAX_LIMIT=100
-CONCURRENCY=3
-MAX_FILE_MB=80
-DOWNLOAD_TIMEOUT_SECONDS=180
-UPLOAD_TIMEOUT_SECONDS=180
-CLAIM_ONLY_STATUS=queued
+SECOP_DOWNLOAD_STRATEGY=fetch_then_browser
 ```
 
-## Test
+## Payload recomendado
 
-```bash
-curl https://TU-DOMINIO.up.railway.app/health
+```json
+{
+  "source": "n8n_daily_after_ingest",
+  "mode": "metadata_and_download",
+  "opportunity_limit": 2500,
+  "batch_size": 50,
+  "download_limit": 100,
+  "metadata_concurrency": 3,
+  "download_concurrency": 2,
+  "max_file_mb": 30,
+  "use_playwright_fallback": true
+}
 ```
-
-
-## Fix incluido en esta versión
-
-- Descarga de archivos SECOP con headers tipo navegador para mitigar HTTP 403.
-- Guarda en `error_message` el status HTTP y una vista previa del body cuando la descarga falla.
-- Mantiene el flujo existente: claim en Edge Function, signed upload y complete/fail por API interna.

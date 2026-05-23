@@ -1,89 +1,52 @@
 import express from "express";
+import { chromium } from "playwright";
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "20mb" }));
 
-const {
-  INTERNAL_API_SECRET,
-  DOCUMENTS_API_URL,
-  SUPABASE_STORAGE_BUCKET = "secop-documents",
-  MAX_FILE_MB = "80",
-  DEFAULT_LIMIT = "20",
-  MAX_LIMIT = "100",
-  CONCURRENCY = "3",
-  DOWNLOAD_TIMEOUT_SECONDS = "180",
-  UPLOAD_TIMEOUT_SECONDS = "180",
-  CLAIM_ONLY_STATUS = "queued"
-} = process.env;
+const PORT = Number(process.env.PORT || 3000);
+const DOCUMENTS_API_URL = process.env.DOCUMENTS_API_URL || "https://infxodoiupqivhgzsgza.supabase.co/functions/v1/secop-documents-api";
+const INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET || "";
+const DEFAULT_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "secop-documents";
+const SECOP_DATASET_URL = "https://www.datos.gov.co/resource/dmgg-8hin.json";
 
-const WORKER_VERSION = "1.0.1-production-secops-403-fix";
-
-function nowIso() {
-  return new Date().toISOString();
+if (!INTERNAL_API_SECRET) {
+  console.warn("[WARN] Missing INTERNAL_API_SECRET. Requests to secop-documents-api will fail.");
 }
 
-function toInt(value, fallback) {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
-  return Number.isFinite(parsed) ? parsed : fallback;
+function intValue(value, fallback, min = 1, max = 10000) {
+  const n = Number(value ?? fallback);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(Math.trunc(n), min), max);
 }
 
-function json(res, status, body) {
-  return res.status(status).json({
-    ...body,
-    timestamp: nowIso()
-  });
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+function sanitizeSegment(value) {
+  return String(value || "unknown")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 120) || "unknown";
 }
 
-function requireInternalSecret(req, res, next) {
-  const provided = req.headers["x-internal-secret"];
-
-  if (!INTERNAL_API_SECRET) {
-    return json(res, 500, {
-      ok: false,
-      error: "INTERNAL_API_SECRET is not configured"
-    });
-  }
-
-  if (provided !== INTERNAL_API_SECRET) {
-    return json(res, 401, {
-      ok: false,
-      error: "Unauthorized"
-    });
-  }
-
-  return next();
+function guessContentType(fileName = "", fallback = "application/octet-stream") {
+  const ext = String(fileName).toLowerCase().split(".").pop();
+  if (ext === "pdf") return "application/pdf";
+  if (["jpg", "jpeg"].includes(ext)) return "image/jpeg";
+  if (ext === "png") return "image/png";
+  if (ext === "doc") return "application/msword";
+  if (ext === "docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (ext === "xls") return "application/vnd.ms-excel";
+  if (ext === "xlsx") return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  if (ext === "zip") return "application/zip";
+  return fallback;
 }
 
-function withTimeout(seconds) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Math.max(1, seconds) * 1000);
-  return { controller, timeout };
-}
-
-async function parseJsonResponse(response) {
-  const text = await response.text();
-  if (!text) return {};
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    return { raw_response: text };
-  }
-}
-
-async function readBodyPreview(response, maxChars = 300) {
-  try {
-    const text = await response.text();
-    return text ? text.slice(0, maxChars) : "";
-  } catch {
-    return "";
-  }
-}
-
-function secopBrowserHeaders() {
+function secopHeaders() {
   return {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "application/pdf,application/octet-stream,image/*,*/*",
     "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
     "Referer": "https://community.secop.gov.co/",
@@ -92,400 +55,382 @@ function secopBrowserHeaders() {
   };
 }
 
-async function downloadSecopFile(url, signal) {
-  return fetch(url, {
-    method: "GET",
-    redirect: "follow",
-    headers: secopBrowserHeaders(),
-    signal
+async function withTimeout(ms, fn) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try { return await fn(controller.signal); }
+  finally { clearTimeout(timer); }
+}
+
+async function callDocumentsApi(action, payload = {}) {
+  const response = await fetch(DOCUMENTS_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-internal-secret": INTERNAL_API_SECRET
+    },
+    body: JSON.stringify({ action, ...payload })
   });
+  const text = await response.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+  if (!response.ok || data.ok === false) {
+    throw new Error(`${action} failed: HTTP ${response.status} ${data.error || data.message || text.slice(0, 300)}`);
+  }
+  return data;
 }
 
-async function callDocumentsApi(payload) {
-  if (!DOCUMENTS_API_URL) {
-    throw new Error("DOCUMENTS_API_URL is not configured");
-  }
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
+}
 
-  const { controller, timeout } = withTimeout(60);
-
-  try {
-    const response = await fetch(DOCUMENTS_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-internal-secret": INTERNAL_API_SECRET
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-
-    const data = await parseJsonResponse(response);
-
-    if (!response.ok || data.ok === false) {
-      throw new Error(
-        data?.error ||
-          data?.message ||
-          data?.raw_response ||
-          `Documents API failed: HTTP ${response.status}`
-      );
+async function runLimited(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let index = 0;
+  const runners = Array.from({ length: Math.max(1, concurrency) }, async () => {
+    while (index < items.length) {
+      const i = index++;
+      try { results[i] = await worker(items[i], i); }
+      catch (error) { results[i] = { ok: false, error: error instanceof Error ? error.message : String(error) }; }
     }
-
-    return data;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function sanitizeFileName(value) {
-  const raw = String(value || "documento")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^\w.\-]+/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_+|_+$/g, "");
-
-  return raw || "documento";
-}
-
-function getExtension(doc) {
-  const ext = String(doc.file_extension || "")
-    .trim()
-    .replace(/^\./, "")
-    .toLowerCase();
-
-  if (ext) return ext;
-
-  const match = String(doc.file_name || "").match(/\.([a-z0-9]+)$/i);
-  return match ? match[1].toLowerCase() : "bin";
-}
-
-function buildStoragePath(doc) {
-  const processId = sanitizeFileName(doc.secop_process_id || "unknown-process");
-  const documentId = sanitizeFileName(doc.secop_document_id || doc.id);
-  const ext = getExtension(doc);
-
-  let fileName = sanitizeFileName(doc.file_name || `${documentId}.${ext}`);
-
-  if (!fileName.toLowerCase().endsWith(`.${ext}`)) {
-    fileName = `${fileName}.${ext}`;
-  }
-
-  return `${processId}/${documentId}-${fileName}`;
-}
-
-function normalizeDocumentsApiRows(data) {
-  if (Array.isArray(data?.documents)) return data.documents;
-  if (Array.isArray(data?.rows)) return data.rows;
-  if (Array.isArray(data?.data)) return data.data;
-  return [];
-}
-
-async function claimDocuments(limit, onlyStatus, source) {
-  const response = await callDocumentsApi({
-    action: "claim_documents_for_worker",
-    limit,
-    only_status: onlyStatus,
-    worker_source: source,
-    worker_version: WORKER_VERSION
   });
-
-  return normalizeDocumentsApiRows(response);
-}
-
-async function createSignedUploadUrl({ documentId, storagePath, contentType, contentLength }) {
-  const response = await callDocumentsApi({
-    action: "create_signed_upload_url",
-    document_id: documentId,
-    storage_path: storagePath,
-    content_type: contentType,
-    content_length: contentLength || null,
-    bucket: SUPABASE_STORAGE_BUCKET
-  });
-
-  const signedUploadUrl =
-    response.signed_upload_url ||
-    response.signedUploadUrl ||
-    response.signedUrl ||
-    response.url;
-
-  if (!signedUploadUrl) {
-    throw new Error("Documents API did not return signed_upload_url");
-  }
-
-  return {
-    signedUploadUrl,
-    token: response.token || null,
-    uploadMethod: response.upload_method || response.method || "PUT"
-  };
-}
-
-async function markComplete({ documentId, storagePath, fileSizeBytes, contentType }) {
-  await callDocumentsApi({
-    action: "complete_document_upload",
-    document_id: documentId,
-    storage_path: storagePath,
-    storage_bucket: SUPABASE_STORAGE_BUCKET,
-    file_size_bytes: fileSizeBytes,
-    content_type: contentType,
-    status: "downloaded",
-    worker_version: WORKER_VERSION
-  });
-}
-
-async function markFailed({ documentId, errorMessage }) {
-  if (!documentId) return;
-
-  await callDocumentsApi({
-    action: "fail_document_upload",
-    document_id: documentId,
-    error_message: String(errorMessage || "Unknown error").slice(0, 2000),
-    worker_version: WORKER_VERSION
-  }).catch(() => {});
-}
-
-async function uploadBufferToSignedUrl({ signedUploadUrl, uploadMethod, token, buffer, contentType }) {
-  const { controller, timeout } = withTimeout(toInt(UPLOAD_TIMEOUT_SECONDS, 180));
-
-  try {
-    const uploadResponse = await fetch(signedUploadUrl, {
-      method: uploadMethod,
-      headers: {
-        "Content-Type": contentType,
-        "Content-Length": String(buffer.length),
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
-      },
-      body: buffer,
-      signal: controller.signal
-    });
-
-    if (!uploadResponse.ok) {
-      const uploadText = await uploadResponse.text().catch(() => "");
-      throw new Error(`Signed upload failed: HTTP ${uploadResponse.status} ${uploadText}`.trim());
-    }
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function processOneDocument(doc, options) {
-  const documentId = doc.id;
-  const maxBytes = options.maxFileMb * 1024 * 1024;
-
-  if (!documentId) {
-    throw new Error("Document missing id");
-  }
-
-  if (!doc.source_download_url) {
-    throw new Error("Document missing source_download_url");
-  }
-
-  const storagePath = buildStoragePath(doc);
-
-  const { controller, timeout } = withTimeout(toInt(DOWNLOAD_TIMEOUT_SECONDS, 180));
-
-  try {
-    const downloadResponse = await downloadSecopFile(doc.source_download_url, controller.signal);
-
-    if (!downloadResponse.ok) {
-      const bodyPreview = await readBodyPreview(downloadResponse, 300);
-      const suffix = bodyPreview ? ` Body: ${bodyPreview}` : "";
-      throw new Error(`Download failed: HTTP ${downloadResponse.status}${suffix}`);
-    }
-
-    const contentType =
-      downloadResponse.headers.get("content-type") || "application/octet-stream";
-
-    const contentLength = Number(downloadResponse.headers.get("content-length") || "0");
-    if (contentLength && contentLength > maxBytes) {
-      throw new Error(`File exceeds MAX_FILE_MB=${options.maxFileMb}`);
-    }
-
-    const arrayBuffer = await downloadResponse.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    if (!buffer.length) {
-      throw new Error("Downloaded file is empty");
-    }
-
-    if (buffer.length > maxBytes) {
-      throw new Error(`File exceeds MAX_FILE_MB=${options.maxFileMb}`);
-    }
-
-    const { signedUploadUrl, token, uploadMethod } = await createSignedUploadUrl({
-      documentId,
-      storagePath,
-      contentType,
-      contentLength: buffer.length
-    });
-
-    await uploadBufferToSignedUrl({
-      signedUploadUrl,
-      uploadMethod,
-      token,
-      buffer,
-      contentType
-    });
-
-    await markComplete({
-      documentId,
-      storagePath,
-      fileSizeBytes: buffer.length,
-      contentType
-    });
-
-    return {
-      ok: true,
-      document_id: documentId,
-      secop_document_id: doc.secop_document_id,
-      storage_path: storagePath,
-      file_size_bytes: buffer.length,
-      content_type: contentType
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function runWithConcurrency(items, concurrency, handler) {
-  const results = [];
-  let cursor = 0;
-
-  async function worker() {
-    while (cursor < items.length) {
-      const index = cursor;
-      cursor += 1;
-
-      try {
-        const value = await handler(items[index], index);
-        results[index] = { status: "fulfilled", value };
-      } catch (error) {
-        results[index] = {
-          status: "rejected",
-          reason: error instanceof Error ? error.message : String(error)
-        };
-      }
-    }
-  }
-
-  const workers = Array.from(
-    { length: Math.min(Math.max(1, concurrency), Math.max(1, items.length)) },
-    () => worker()
-  );
-
-  await Promise.all(workers);
+  await Promise.all(runners);
   return results;
 }
 
-app.get("/", (_req, res) => {
-  return json(res, 200, {
-    ok: true,
-    service: "radar-documents-worker",
-    version: WORKER_VERSION,
-    mode: "railway-heavy-processing-edge-function-secure-control",
-    routes: ["/health", "POST /secop-documents/process-pending"]
-  });
-});
+function escapeSoql(value) { return String(value || "").trim().replace(/'/g, "''"); }
 
-app.get("/health", (_req, res) => {
-  return json(res, 200, {
-    ok: true,
-    service: "radar-documents-worker",
-    version: WORKER_VERSION,
-    mode: "edge-api",
-    has_documents_api_url: Boolean(DOCUMENTS_API_URL),
-    has_internal_secret: Boolean(INTERNAL_API_SECRET),
-    bucket: SUPABASE_STORAGE_BUCKET,
-    default_limit: toInt(DEFAULT_LIMIT, 20),
-    max_limit: toInt(MAX_LIMIT, 100),
-    concurrency: toInt(CONCURRENCY, 3),
-    max_file_mb: toInt(MAX_FILE_MB, 80)
-  });
-});
+async function fetchSecopDocumentsBatch(viableRows, signal) {
+  const ids = viableRows.map(v => escapeSoql(v.secop_process_id)).filter(Boolean);
+  if (!ids.length) return [];
+  const inList = ids.map(id => `'${id}'`).join(",");
+  const query = `SELECT id_documento,proceso,nombre_archivo,tamanno_archivo,extensi_n,descripci_n,fecha_carga,entidad,nit_entidad,url_descarga_documento WHERE proceso in(${inList}) LIMIT 50000`;
+  const params = new URLSearchParams({ "$query": query });
+  const url = `${SECOP_DATASET_URL}?${params.toString()}`;
+  const response = await fetch(url, { method: "GET", headers: { "Accept": "application/json" }, signal });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`datos.gov.co documents batch failed: HTTP ${response.status} ${text.slice(0, 300)}`);
+  try { return text ? JSON.parse(text) : []; }
+  catch { throw new Error(`datos.gov.co documents batch returned invalid JSON: ${text.slice(0, 300)}`); }
+}
 
-app.post("/secop-documents/process-pending", requireInternalSecret, async (req, res) => {
-  const maxLimit = toInt(MAX_LIMIT, 100);
-  const defaultLimit = toInt(DEFAULT_LIMIT, 20);
-  const requestedLimit = toInt(req.body?.limit, defaultLimit);
-  const limit = Math.min(Math.max(1, requestedLimit), maxLimit);
+function getDownloadUrl(value) {
+  if (!value) return null;
+  if (typeof value === "object") return value.url || value.uri || null;
+  const text = String(value).trim();
+  return text || null;
+}
 
-  const concurrency = Math.min(
-    Math.max(1, toInt(req.body?.concurrency, toInt(CONCURRENCY, 3))),
-    10
-  );
+function toNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(String(value).replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
 
-  const onlyStatus = String(req.body?.only_status || CLAIM_ONLY_STATUS || "queued");
-  const source = String(req.body?.source || "manual");
-  const maxFileMb = toInt(req.body?.max_file_mb, toInt(MAX_FILE_MB, 80));
+function classifyDocument(fileName, description) {
+  const text = `${fileName || ""} ${description || ""}`
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  if (text.includes("pliego")) return "pliego";
+  if (text.includes("estudio previo") || text.includes("estudios previos")) return "estudios_previos";
+  if (text.includes("invitacion")) return "invitacion";
+  if (text.includes("adenda")) return "adenda";
+  if (text.includes("contrato")) return "contrato";
+  if (text.includes("anexo")) return "anexo";
+  if (text.includes("formato")) return "formato";
+  return "otro";
+}
 
-  const summary = {
-    ok: true,
-    service: "radar-documents-worker",
-    version: WORKER_VERSION,
-    source,
-    mode: "railway_downloads_edge_function_signed_upload",
-    limit,
-    concurrency,
-    max_file_mb: maxFileMb,
-    selected: 0,
-    processed: 0,
-    downloaded: 0,
-    failed: 0,
-    errors: [],
-    results: []
-  };
+function buildMetadataItems(viableRows, docs) {
+  const docsByProceso = new Map();
+  for (const d of docs || []) {
+    const proceso = String(d.proceso || "").trim();
+    if (!proceso) continue;
+    if (!docsByProceso.has(proceso)) docsByProceso.set(proceso, []);
+    docsByProceso.get(proceso).push(d);
+  }
 
-  try {
-    const documents = await claimDocuments(limit, onlyStatus, source);
-    summary.selected = documents.length;
-
-    const results = await runWithConcurrency(documents, concurrency, async (doc) => {
-      try {
-        const result = await processOneDocument(doc, { maxFileMb });
-        summary.downloaded += 1;
-        summary.processed += 1;
-        return result;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-
-        await markFailed({
-          documentId: doc?.id,
-          errorMessage: message
-        });
-
-        summary.failed += 1;
-        summary.processed += 1;
-
-        const errorItem = {
-          document_id: doc?.id || null,
-          secop_document_id: doc?.secop_document_id || null,
-          error: message
-        };
-
-        summary.errors.push(errorItem);
+  return viableRows.map(viable => {
+    const proceso = String(viable.secop_process_id || "").trim();
+    const processDocs = docsByProceso.get(proceso) || [];
+    const normalizedDocs = processDocs
+      .filter(d => d && d.id_documento)
+      .map(d => {
+        const fileName = d.nombre_archivo || null;
+        const description = d.descripci_n || null;
+        const downloadUrl = getDownloadUrl(d.url_descarga_documento);
         return {
-          ok: false,
-          ...errorItem
+          viable_opportunity_id: viable.id,
+          external_id: viable.external_id ?? null,
+          secop_process_id: proceso,
+          secop_document_id: String(d.id_documento),
+          file_name: fileName,
+          file_extension: d.extensi_n || null,
+          file_size_bytes: toNumberOrNull(d.tamanno_archivo),
+          description,
+          upload_date: d.fecha_carga || null,
+          entity_name: d.entidad || null,
+          entity_nit: d.nit_entidad || null,
+          source_download_url: downloadUrl,
+          download_status: "queued",
+          document_type: classifyDocument(fileName, description),
+          raw_json: d
         };
+      })
+      .filter(d => d.source_download_url);
+
+    const totalFileSizeBytes = normalizedDocs.reduce((acc, d) => acc + Number(d.file_size_bytes || 0), 0);
+    return {
+      viable_opportunity_id: viable.id,
+      external_id: viable.external_id ?? null,
+      secop_process_id: proceso,
+      documents_found: normalizedDocs.length,
+      documents_total_size_bytes: totalFileSizeBytes,
+      documents: normalizedDocs
+    };
+  });
+}
+
+async function fetchFileWithHeaders(url, timeoutMs) {
+  return await withTimeout(timeoutMs, async signal => {
+    const response = await fetch(url, { method: "GET", redirect: "follow", headers: secopHeaders(), signal });
+    const bodyTextOnError = async () => {
+      try { return (await response.text()).slice(0, 300); } catch { return ""; }
+    };
+    if (!response.ok) {
+      const body = await bodyTextOnError();
+      const error = new Error(`HTTP ${response.status} ${body}`.trim());
+      error.status = response.status;
+      throw error;
+    }
+    const arr = await response.arrayBuffer();
+    return {
+      buffer: Buffer.from(arr),
+      contentType: response.headers.get("content-type") || "application/octet-stream"
+    };
+  });
+}
+
+async function fetchFileWithPlaywright(url, timeoutMs, proxyUrl) {
+  let browser;
+  try {
+    const launchOptions = { headless: true };
+    if (proxyUrl) launchOptions.proxy = { server: proxyUrl };
+    browser = await chromium.launch(launchOptions);
+    const context = await browser.newContext({
+      userAgent: secopHeaders()["User-Agent"],
+      locale: "es-CO",
+      extraHTTPHeaders: {
+        "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
+        "Referer": "https://community.secop.gov.co/"
       }
     });
+    const page = await context.newPage();
+    await page.goto("https://community.secop.gov.co/", { waitUntil: "domcontentloaded", timeout: Math.min(timeoutMs, 60000) }).catch(() => null);
+    const response = await context.request.get(url, { timeout: timeoutMs, headers: secopHeaders() });
+    if (!response.ok()) {
+      const body = (await response.text().catch(() => "")).slice(0, 300);
+      throw new Error(`Playwright download failed: HTTP ${response.status()} ${body}`.trim());
+    }
+    const buffer = await response.body();
+    return {
+      buffer,
+      contentType: response.headers()["content-type"] || "application/octet-stream"
+    };
+  } finally {
+    if (browser) await browser.close().catch(() => null);
+  }
+}
 
-    summary.results = results.map((item) =>
-      item.status === "fulfilled" ? item.value : { ok: false, error: item.reason }
-    );
-
-    return json(res, 200, summary);
+async function downloadSecopFile(url, options = {}) {
+  const timeoutMs = intValue(options.timeoutMs, 180000, 10000, 600000);
+  const usePlaywrightFallback = options.usePlaywrightFallback !== false;
+  try {
+    return await fetchFileWithHeaders(url, timeoutMs);
   } catch (error) {
-    return json(res, 500, {
-      ...summary,
-      ok: false,
-      stage: "process_pending_documents",
-      error: error instanceof Error ? error.message : String(error)
+    const status = error?.status;
+    if (!usePlaywrightFallback || status !== 403) throw new Error(`Download failed: ${error.message}`);
+    return await fetchFileWithPlaywright(url, timeoutMs, process.env.SECOP_PROXY_URL || "");
+  }
+}
+
+async function uploadToSignedUrl(signedUrl, buffer, contentType, timeoutMs) {
+  return await withTimeout(timeoutMs, async signal => {
+    const response = await fetch(signedUrl, {
+      method: "PUT",
+      headers: { "Content-Type": contentType || "application/octet-stream" },
+      body: buffer,
+      signal
     });
+    const text = await response.text().catch(() => "");
+    if (!response.ok) throw new Error(`Signed upload failed: HTTP ${response.status} ${text.slice(0, 300)}`);
+    return true;
+  });
+}
+
+function buildStoragePath(doc) {
+  const processId = sanitizeSegment(doc.secop_process_id || doc.external_id || "unknown_process");
+  const docId = sanitizeSegment(doc.secop_document_id || doc.id);
+  const fileName = sanitizeSegment(doc.file_name || `${docId}.bin`);
+  return `${processId}/${docId}_${fileName}`;
+}
+
+async function processOneDocument(doc, options) {
+  const maxBytes = intValue(options.max_file_mb, 30, 1, 500) * 1024 * 1024;
+  const downloadTimeoutMs = intValue(process.env.DOWNLOAD_TIMEOUT_SECONDS, 180, 10, 600) * 1000;
+  const uploadTimeoutMs = intValue(process.env.UPLOAD_TIMEOUT_SECONDS, 180, 10, 600) * 1000;
+  const sourceUrl = doc.source_download_url;
+  if (!sourceUrl) throw new Error("Missing source_download_url");
+
+  try {
+    const downloaded = await downloadSecopFile(sourceUrl, {
+      timeoutMs: downloadTimeoutMs,
+      usePlaywrightFallback: options.use_playwright_fallback !== false
+    });
+
+    if (downloaded.buffer.length > maxBytes) {
+      throw new Error(`File too large: ${downloaded.buffer.length} bytes > ${maxBytes}`);
+    }
+
+    const contentType = downloaded.contentType || guessContentType(doc.file_name);
+    const storagePath = buildStoragePath(doc);
+    const signed = await callDocumentsApi("create_signed_upload_url", {
+      document_id: doc.id,
+      bucket: DEFAULT_BUCKET,
+      storage_path: storagePath,
+      content_type: contentType
+    });
+
+    const signedUrl = signed.signed_upload_url || signed.signedUrl;
+    if (!signedUrl) throw new Error("Missing signed upload URL from Edge Function");
+
+    await uploadToSignedUrl(signedUrl, downloaded.buffer, contentType, uploadTimeoutMs);
+
+    await callDocumentsApi("complete_document_upload", {
+      document_id: doc.id,
+      storage_bucket: DEFAULT_BUCKET,
+      storage_path: storagePath,
+      file_size_bytes: downloaded.buffer.length,
+      content_type: contentType
+    });
+
+    return { ok: true, document_id: doc.id, secop_document_id: doc.secop_document_id, storage_path: storagePath };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await callDocumentsApi("fail_document_upload", { document_id: doc.id, error_message: message }).catch(() => null);
+    return { ok: false, document_id: doc.id, secop_document_id: doc.secop_document_id, error: message };
+  }
+}
+
+async function processPendingDocuments(body = {}) {
+  const limit = intValue(body.limit, process.env.DOWNLOAD_LIMIT || 20, 1, 500);
+  const concurrency = intValue(body.concurrency ?? body.download_concurrency, process.env.DOWNLOAD_CONCURRENCY || 1, 1, 10);
+  const onlyStatus = body.only_status || process.env.CLAIM_ONLY_STATUS || "queued";
+  const claim = await callDocumentsApi("claim_documents_for_worker", { limit, only_status: onlyStatus });
+  const documents = Array.isArray(claim.documents) ? claim.documents : [];
+
+  const results = await runLimited(documents, concurrency, doc => processOneDocument(doc, body));
+  const downloaded = results.filter(r => r?.ok).length;
+  const failed = results.filter(r => r && r.ok === false).length;
+  return {
+    selected: documents.length,
+    processed: results.length,
+    downloaded,
+    failed,
+    results
+  };
+}
+
+async function processPipeline(body = {}) {
+  const opportunityLimit = intValue(body.opportunity_limit, process.env.OPPORTUNITY_LIMIT || 2500, 1, 2500);
+  const batchSize = intValue(body.batch_size, process.env.BATCH_SIZE || 50, 1, 100);
+  const metadataConcurrency = intValue(body.metadata_concurrency, process.env.METADATA_CONCURRENCY || 3, 1, 8);
+  const source = body.source || "railway_documents_pipeline";
+
+  const viableResp = await callDocumentsApi("list_viable_for_documents", {
+    limit: opportunityLimit,
+    older_than_hours: body.older_than_hours ?? 24,
+    quality_statuses: body.quality_statuses,
+    exclude_document_statuses: body.exclude_document_statuses
+  });
+
+  const viableRows = Array.isArray(viableResp.rows) ? viableResp.rows : [];
+  const batches = chunkArray(viableRows, batchSize);
+
+  const batchResults = await runLimited(batches, metadataConcurrency, async (batch, idx) => {
+    const docs = await withTimeout(120000, signal => fetchSecopDocumentsBatch(batch, signal));
+    const items = buildMetadataItems(batch, docs);
+    if (body.dry_run === true) {
+      return { ok: true, dry_run: true, batch_number: idx + 1, viables: batch.length, docs_found: docs.length, items: items.length };
+    }
+    const saved = await callDocumentsApi("save_documents_metadata_batch", {
+      source,
+      batch_number: idx + 1,
+      items
+    });
+    return { ok: true, batch_number: idx + 1, viables: batch.length, docs_found: docs.length, saved };
+  });
+
+  const metadataDocsFound = batchResults.reduce((acc, r) => acc + Number(r?.docs_found || 0), 0);
+  const metadataSaved = batchResults.reduce((acc, r) => acc + Number(r?.saved?.upserted || 0), 0);
+  const metadataFailedBatches = batchResults.filter(r => r?.ok === false).length;
+
+  let downloadResult = { selected: 0, processed: 0, downloaded: 0, failed: 0, results: [] };
+  if (body.dry_run !== true) {
+    downloadResult = await processPendingDocuments({
+      ...body,
+      limit: body.download_limit ?? process.env.DOWNLOAD_LIMIT ?? 100,
+      concurrency: body.download_concurrency ?? process.env.DOWNLOAD_CONCURRENCY ?? 2,
+      only_status: body.only_status || "queued"
+    });
+  }
+
+  return {
+    opportunities_selected: viableRows.length,
+    metadata_batches: batches.length,
+    metadata_failed_batches: metadataFailedBatches,
+    documents_found: metadataDocsFound,
+    documents_queued_or_upserted: metadataSaved,
+    download: downloadResult,
+    metadata_results: batchResults
+  };
+}
+
+function requireInternal(req, res, next) {
+  const provided = req.headers["x-internal-secret"] || "";
+  if (!INTERNAL_API_SECRET || provided !== INTERNAL_API_SECRET) {
+    return res.status(401).json({ ok: false, error: "Unauthorized: missing or invalid x-internal-secret" });
+  }
+  next();
+}
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "radar-documents-worker", version: "2.0.0-pipeline", has_documents_api_url: Boolean(DOCUMENTS_API_URL), has_internal_secret: Boolean(INTERNAL_API_SECRET) });
+});
+
+app.post("/secop-documents/process-pending", requireInternal, async (req, res) => {
+  const started = Date.now();
+  try {
+    const result = await processPendingDocuments(req.body || {});
+    res.json({ ok: true, service: "radar-documents-worker", version: "2.0.0-pipeline", mode: "process_pending", ...result, duration_ms: Date.now() - started, timestamp: new Date().toISOString() });
+  } catch (error) {
+    res.status(500).json({ ok: false, service: "radar-documents-worker", mode: "process_pending", error: error instanceof Error ? error.message : String(error), duration_ms: Date.now() - started, timestamp: new Date().toISOString() });
   }
 });
 
-const port = Number(process.env.PORT || 3000);
+app.post("/secop-documents/process-pipeline", requireInternal, async (req, res) => {
+  const started = Date.now();
+  try {
+    const result = await processPipeline(req.body || {});
+    res.json({ ok: true, service: "radar-documents-worker", version: "2.0.0-pipeline", mode: "metadata_and_download", ...result, duration_ms: Date.now() - started, timestamp: new Date().toISOString() });
+  } catch (error) {
+    res.status(500).json({ ok: false, service: "radar-documents-worker", version: "2.0.0-pipeline", mode: "metadata_and_download", error: error instanceof Error ? error.message : String(error), duration_ms: Date.now() - started, timestamp: new Date().toISOString() });
+  }
+});
 
-app.listen(port, "0.0.0.0", () => {
-  console.log(`radar-documents-worker ${WORKER_VERSION} listening on 0.0.0.0:${port}`);
+app.listen(PORT, () => {
+  console.log(`radar-documents-worker 2.0.0-pipeline listening on ${PORT}`);
 });
