@@ -1,12 +1,12 @@
 {
   "name": "radar-documents-worker-production",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
-  "description": "Railway worker for heavy SECOP document downloading and Supabase Storage upload via secure Edge Function API.",
+  "description": "Railway worker for heavy SECOP document processing through secure Supabase Edge Function API.",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "engines": {
     "node": ">=20"
