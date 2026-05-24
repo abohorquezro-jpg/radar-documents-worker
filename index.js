@@ -893,7 +893,6 @@ async function runFullDailyPipeline(body = {}) {
     error: error instanceof Error ? error.message : String(error)
   }));
 
-  // Para documentos no uses batch_size=500. Ese valor es para fetch/ingest de oportunidades.
   const documentsBody = {
     ...body,
     source: body.documents_source || "railway_full_daily_documents_pipeline",
@@ -1012,7 +1011,17 @@ app.get("/health", (req, res) => {
     has_internal_secret: Boolean(INTERNAL_API_SECRET),
     has_ingest_api_url: Boolean(INGEST_API_URL),
     has_ingest_secret: Boolean(INGEST_SECRET),
-    has_matching_jobs_api_url: Boolean(MATCHING_JOBS_API_URL)
+    has_matching_jobs_api_url: Boolean(MATCHING_JOBS_API_URL),
+    routes: [
+      "GET /health",
+      "GET /secop-documents/pipeline-status/:runId",
+      "POST /secop-documents/process-pending",
+      "POST /secop-documents/process-pipeline",
+      "POST /secop-documents/full-daily-pipeline",
+      "POST /documents/backfill",
+      "POST /documents/process-pending",
+      "POST /documents/diagnostics"
+    ]
   });
 });
 
@@ -1059,9 +1068,6 @@ app.post("/secop-documents/process-pending", requireInternal, async (req, res) =
   }
 });
 
-// Endpoint compatible:
-// - Si mode=full_daily: responde 202 y corre fetch SECOP + ingest + matching + documentos en background.
-// - Si mode=metadata_and_download o no envías mode full_daily: conserva el comportamiento original de documentos.
 app.post("/secop-documents/process-pipeline", requireInternal, async (req, res) => {
   const body = req.body || {};
 
@@ -1116,7 +1122,6 @@ app.post("/secop-documents/process-pipeline", requireInternal, async (req, res) 
   }
 });
 
-// Alias explícito por si prefieres apuntar n8n a una ruta dedicada.
 app.post("/secop-documents/full-daily-pipeline", requireInternal, async (req, res) => {
   const body = { ...(req.body || {}), mode: "full_daily" };
   const runId = startBackgroundPipeline(body);
@@ -1131,6 +1136,254 @@ app.post("/secop-documents/full-daily-pipeline", requireInternal, async (req, re
     status_url: `/secop-documents/pipeline-status/${runId}`,
     started_at: new Date().toISOString()
   });
+});
+
+// ============================================================================
+// n8n compatibility aliases
+// Estas rutas corrigen el error:
+// Cannot POST /documents/backfill
+// ============================================================================
+
+app.post("/documents/backfill", requireInternal, async (req, res) => {
+  const started = Date.now();
+  const body = req.body || {};
+
+  try {
+    const limit = intValue(
+      body.limit ?? body.opportunity_limit,
+      process.env.DOCUMENTS_BACKFILL_LIMIT || 20,
+      1,
+      2500
+    );
+
+    const batchSize = intValue(
+      body.documents_batch_size ?? body.batch_size,
+      Math.min(limit, 50),
+      1,
+      100
+    );
+
+    const metadataConcurrency = intValue(
+      body.metadata_concurrency,
+      process.env.METADATA_CONCURRENCY || 2,
+      1,
+      8
+    );
+
+    const source = body.source || "n8n_secop_documents_backfill";
+    const dryRun = body.dry_run === true;
+
+    const excludeDocumentStatuses =
+      Array.isArray(body.exclude_document_statuses)
+        ? body.exclude_document_statuses
+        : body.reprocess_existing === true
+          ? ["missing_process_id"]
+          : ["downloaded", "no_documents", "missing_process_id"];
+
+    console.log("[documents/backfill] started", {
+      source,
+      limit,
+      batch_size: batchSize,
+      metadata_concurrency: metadataConcurrency,
+      dry_run: dryRun,
+      exclude_document_statuses: excludeDocumentStatuses
+    });
+
+    const viableResp = await callDocumentsApi("list_viable_for_documents", {
+      limit,
+      older_than_hours: body.older_than_hours ?? 0,
+      ignore_checked_at: body.ignore_checked_at === true,
+      include_no_documents: body.include_no_documents === true,
+      quality_statuses: body.quality_statuses ?? [
+        "actionable",
+        "open_without_closing_date"
+      ],
+      exclude_document_statuses: excludeDocumentStatuses
+    });
+
+    const viableRows = Array.isArray(viableResp.rows) ? viableResp.rows : [];
+    const batches = chunkArray(viableRows, batchSize);
+
+    console.log("[documents/backfill] viable rows selected", {
+      selected: viableRows.length,
+      batches: batches.length
+    });
+
+    const batchResults = await runLimited(
+      batches,
+      metadataConcurrency,
+      async (batch, idx) => {
+        const docs = await withTimeout(120000, signal =>
+          fetchSecopDocumentsBatch(batch, signal)
+        );
+
+        const items = buildMetadataItems(batch, docs);
+
+        const noDocuments = items.filter(
+          item => Number(item.documents_found || 0) === 0
+        ).length;
+
+        if (dryRun) {
+          return {
+            ok: true,
+            dry_run: true,
+            batch_number: idx + 1,
+            viables: batch.length,
+            docs_found: docs.length,
+            items: items.length,
+            no_documents: noDocuments,
+            preview: items.slice(0, 3)
+          };
+        }
+
+        const saved = await callDocumentsApi("save_documents_metadata_batch", {
+          source,
+          batch_number: idx + 1,
+          items
+        });
+
+        return {
+          ok: true,
+          batch_number: idx + 1,
+          viables: batch.length,
+          docs_found: docs.length,
+          items: items.length,
+          no_documents: noDocuments,
+          saved
+        };
+      }
+    );
+
+    const processed = batchResults.reduce(
+      (acc, r) => acc + Number(r?.viables || 0),
+      0
+    );
+
+    const documentsFound = batchResults.reduce(
+      (acc, r) => acc + Number(r?.docs_found || 0),
+      0
+    );
+
+    const documentsInserted = batchResults.reduce(
+      (acc, r) => acc + Number(r?.saved?.upserted || 0),
+      0
+    );
+
+    const noDocuments = batchResults.reduce(
+      (acc, r) => acc + Number(r?.no_documents || 0),
+      0
+    );
+
+    const failedBatches = batchResults.filter(r => r?.ok === false).length;
+
+    const response = {
+      ok: failedBatches === 0,
+      service: "radar-documents-worker",
+      version: SERVICE_VERSION,
+      action: "documents_backfill",
+      mode: "metadata_only",
+      dry_run: dryRun,
+      claimed: viableRows.length,
+      processed,
+      metadata_batches: batches.length,
+      metadata_failed_batches: failedBatches,
+      documents_found: documentsFound,
+      documents_inserted: documentsInserted,
+      no_documents: noDocuments,
+      duration_ms: Date.now() - started,
+      timestamp: new Date().toISOString(),
+      results: batchResults
+    };
+
+    console.log("[documents/backfill] complete", {
+      claimed: response.claimed,
+      processed: response.processed,
+      documents_found: response.documents_found,
+      documents_inserted: response.documents_inserted,
+      no_documents: response.no_documents,
+      failed_batches: response.metadata_failed_batches,
+      duration_ms: response.duration_ms
+    });
+
+    return res.status(failedBatches > 0 ? 207 : 200).json(response);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+
+    console.error("[documents/backfill] failed", {
+      error: message,
+      duration_ms: Date.now() - started
+    });
+
+    return res.status(500).json({
+      ok: false,
+      service: "radar-documents-worker",
+      version: SERVICE_VERSION,
+      action: "documents_backfill",
+      error: message,
+      duration_ms: Date.now() - started,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+app.post("/documents/process-pending", requireInternal, async (req, res) => {
+  const started = Date.now();
+
+  try {
+    const result = await processPendingDocuments(req.body || {});
+
+    return res.json({
+      ok: true,
+      service: "radar-documents-worker",
+      version: SERVICE_VERSION,
+      action: "documents_process_pending",
+      mode: "download_and_upload",
+      ...result,
+      duration_ms: Date.now() - started,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+
+    console.error("[documents/process-pending] failed", {
+      error: message,
+      duration_ms: Date.now() - started
+    });
+
+    return res.status(500).json({
+      ok: false,
+      service: "radar-documents-worker",
+      version: SERVICE_VERSION,
+      action: "documents_process_pending",
+      error: message,
+      duration_ms: Date.now() - started,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+app.post("/documents/diagnostics", requireInternal, async (req, res) => {
+  try {
+    const result = await callDocumentsApi("diagnostics", req.body || {});
+
+    return res.json({
+      ok: true,
+      service: "radar-documents-worker",
+      version: SERVICE_VERSION,
+      action: "documents_diagnostics",
+      diagnostics: result,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      service: "radar-documents-worker",
+      version: SERVICE_VERSION,
+      action: "documents_diagnostics",
+      error: error instanceof Error ? error.message : String(error),
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 app.listen(PORT, () => {
